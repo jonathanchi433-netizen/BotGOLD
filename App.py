@@ -57,6 +57,13 @@ def round_down(value, decimals=3):
     return math.floor(value * factor) / factor
 
 
+def safe_float(value, default=None):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
 # =========================
 # FIRMA BINGX PRIVADO
 # =========================
@@ -678,14 +685,44 @@ def webhook():
         }), 400
 
     try:
-        # cierres explícitos
+        # 1) Cierres explícitos siempre se ejecutan
         if action in ["close_long", "close_short"]:
             close_result = execute_explicit_close(action)
             print("CIERRE EXPLÍCITO ->", close_result, flush=True)
             append_event_log(action, close_result.get("message", "Cierre explícito"), close_result)
             return jsonify({"ok": True, "result": close_result}), 200
 
-        # no operar contra 15m
+        # 2) Si hay posición contraria abierta, primero cerrarla
+        close_result = execute_close_by_opposite_signal(action)
+        if close_result is not None:
+            print("CIERRE POR SEÑAL CONTRARIA ->", close_result, flush=True)
+            append_event_log(action, close_result.get("message", "Cierre por señal contraria"), close_result)
+
+            # Después de cerrar, revisar si la nueva señal está alineada con 15m
+            alignment = determine_alignment(action, htf_signal)
+            if alignment != "with_htf":
+                msg = f"Posición cerrada, pero nueva entrada bloqueada: acción {action_raw} no está a favor del 15m ({htf_signal})"
+                print(msg, flush=True)
+                append_event_log(action, msg, {"received": data, "alignment": alignment})
+                return jsonify({
+                    "ok": True,
+                    "result": close_result,
+                    "filtered": True,
+                    "message": msg
+                }), 200
+
+            # Si sí está alineada, abrir la nueva posición
+            open_result = execute_open(action)
+            print("REVERSAL EJECUTADO ->", open_result, flush=True)
+            append_event_log(action, open_result.get("message", "Reversal ejecutado"), open_result)
+
+            return jsonify({
+                "ok": True,
+                "closed_result": close_result,
+                "opened_result": open_result
+            }), 200
+
+        # 3) Si no había posición contraria, solo abrir si está a favor del 15m
         alignment = determine_alignment(action, htf_signal)
         if alignment != "with_htf":
             msg = f"Trade bloqueado: acción {action_raw} no está a favor del 15m ({htf_signal})"
@@ -697,14 +734,7 @@ def webhook():
                 "message": msg
             }), 200
 
-        # cierre por señal contraria
-        close_result = execute_close_by_opposite_signal(action)
-        if close_result is not None:
-            print("CIERRE POR SEÑAL CONTRARIA ->", close_result, flush=True)
-            append_event_log(action, close_result.get("message", "Cierre por señal contraria"), close_result)
-            return jsonify({"ok": True, "result": close_result}), 200
-
-        # abrir nueva posición
+        # 4) Abrir nueva posición
         result = execute_open(action)
         print("RESULTADO TRADE ->", result, flush=True)
         append_event_log(action, result.get("message", "Trade ejecutado"), result)
