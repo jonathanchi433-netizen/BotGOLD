@@ -18,18 +18,23 @@ app = Flask(__name__)
 API_KEY = os.getenv("BINGX_API_KEY", "").strip()
 SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "").strip()
 
-SYMBOL = os.getenv("SYMBOL", "XAUTUSDT.P").strip()
+SYMBOL = os.getenv("SYMBOL", "XAUT-USDT").strip()
 LEVERAGE = int(os.getenv("LEVERAGE", "5"))
 QTY_BUFFER = float(os.getenv("QTY_BUFFER", "0.95"))
 
 # Riesgo fijo
 RISK_PERCENT_FIXED = 80.0
 
+# Parciales
+TP1_CLOSE_RATIO = 0.30
+TP2_CLOSE_RATIO = 0.30
+
 BASE_URL = "https://open-api.bingx.com"
 
 print(
     f"GOLD BOT CONFIG -> SYMBOL={SYMBOL}, LEVERAGE={LEVERAGE}, "
-    f"QTY_BUFFER={QTY_BUFFER}, RISK_PERCENT_FIXED={RISK_PERCENT_FIXED}",
+    f"QTY_BUFFER={QTY_BUFFER}, RISK_PERCENT_FIXED={RISK_PERCENT_FIXED}, "
+    f"TP1={TP1_CLOSE_RATIO}, TP2={TP2_CLOSE_RATIO}",
     flush=True
 )
 
@@ -322,10 +327,18 @@ def sync_state_with_exchange():
             "opened_at": utc_now(),
             "symbol": SYMBOL,
             "leverage": LEVERAGE,
-            "risk_percent": RISK_PERCENT_FIXED
+            "risk_percent": RISK_PERCENT_FIXED,
+            "tp1_done": False,
+            "tp2_done": False
         }
         save_state(inferred_state)
         state = inferred_state
+
+    # Asegurar campos nuevos
+    if "tp1_done" not in state:
+        state["tp1_done"] = False
+    if "tp2_done" not in state:
+        state["tp2_done"] = False
 
     return state, current
 
@@ -406,6 +419,21 @@ def close_position(current_side, current_qty):
     return None
 
 
+def close_partial_position(current_side, current_qty, ratio):
+    qty_to_close = round_down(current_qty * ratio, 3)
+
+    # Si el parcial sale muy pequeño, cerrar el mínimo posible o todo lo restante
+    if qty_to_close <= 0:
+        qty_to_close = round_down(current_qty, 3)
+
+    if current_side == "LONG":
+        return place_order("SELL", qty_to_close, reduce_only=True), qty_to_close
+    elif current_side == "SHORT":
+        return place_order("BUY", qty_to_close, reduce_only=True), qty_to_close
+
+    return None, 0.0
+
+
 def open_new_position(action, qty):
     if action == "buy":
         return place_order("BUY", qty, reduce_only=False)
@@ -459,7 +487,9 @@ def execute_open(action):
         "opened_at": utc_now(),
         "symbol": SYMBOL,
         "leverage": LEVERAGE,
-        "risk_percent": RISK_PERCENT_FIXED
+        "risk_percent": RISK_PERCENT_FIXED,
+        "tp1_done": False,
+        "tp2_done": False
     }
     save_state(new_state)
 
@@ -618,12 +648,176 @@ def execute_explicit_close(action):
     return None
 
 
+def execute_partial_close(action):
+    state, current = sync_state_with_exchange()
+    current_side = current["side"]
+    current_qty = current["qty"]
+
+    if state is None or current_side == "NONE" or current_qty <= 0:
+        return {"message": "No hay posición abierta para parcial."}
+
+    entry_price = state.get("entry_price")
+    opened_at = state.get("opened_at", "")
+    tp1_done = state.get("tp1_done", False)
+    tp2_done = state.get("tp2_done", False)
+
+    if action == "tp1_long":
+        if current_side != "LONG":
+            return {"message": "No hay LONG abierto para TP1_LONG."}
+        if tp1_done:
+            return {"message": "TP1_LONG ya ejecutado."}
+
+        close_result, qty_closed = close_partial_position(current_side, current_qty, TP1_CLOSE_RATIO)
+        close_price, executed_qty = extract_order_data(close_result)
+        executed_qty = executed_qty if executed_qty is not None else qty_closed
+
+        pnl_gross = calc_gross_pnl("LONG", executed_qty, entry_price, close_price)
+
+        state["tp1_done"] = True
+        state["qty"] = round_down(max(current_qty - executed_qty, 0.0), 3)
+        save_state(state)
+
+        append_trade_log(
+            opened_at=opened_at,
+            closed_at=utc_now(),
+            side="LONG",
+            qty=executed_qty,
+            entry_price=entry_price,
+            exit_price=close_price,
+            pnl_gross=pnl_gross,
+            close_reason="tp1_long_30pct"
+        )
+
+        return {
+            "message": "TP1_LONG ejecutado (30%)",
+            "closed_qty": executed_qty,
+            "remaining_qty_state": state["qty"],
+            "exit_price": close_price,
+            "pnl_gross": pnl_gross,
+            "close_result": close_result
+        }
+
+    if action == "tp2_long":
+        if current_side != "LONG":
+            return {"message": "No hay LONG abierto para TP2_LONG."}
+        if not tp1_done:
+            return {"message": "TP2_LONG bloqueado: primero debe ejecutarse TP1_LONG."}
+        if tp2_done:
+            return {"message": "TP2_LONG ya ejecutado."}
+
+        close_result, qty_closed = close_partial_position(current_side, current_qty, TP2_CLOSE_RATIO)
+        close_price, executed_qty = extract_order_data(close_result)
+        executed_qty = executed_qty if executed_qty is not None else qty_closed
+
+        pnl_gross = calc_gross_pnl("LONG", executed_qty, entry_price, close_price)
+
+        state["tp2_done"] = True
+        state["qty"] = round_down(max(current_qty - executed_qty, 0.0), 3)
+        save_state(state)
+
+        append_trade_log(
+            opened_at=opened_at,
+            closed_at=utc_now(),
+            side="LONG",
+            qty=executed_qty,
+            entry_price=entry_price,
+            exit_price=close_price,
+            pnl_gross=pnl_gross,
+            close_reason="tp2_long_30pct"
+        )
+
+        return {
+            "message": "TP2_LONG ejecutado (30%)",
+            "closed_qty": executed_qty,
+            "remaining_qty_state": state["qty"],
+            "exit_price": close_price,
+            "pnl_gross": pnl_gross,
+            "close_result": close_result
+        }
+
+    if action == "tp1_short":
+        if current_side != "SHORT":
+            return {"message": "No hay SHORT abierto para TP1_SHORT."}
+        if tp1_done:
+            return {"message": "TP1_SHORT ya ejecutado."}
+
+        close_result, qty_closed = close_partial_position(current_side, current_qty, TP1_CLOSE_RATIO)
+        close_price, executed_qty = extract_order_data(close_result)
+        executed_qty = executed_qty if executed_qty is not None else qty_closed
+
+        pnl_gross = calc_gross_pnl("SHORT", executed_qty, entry_price, close_price)
+
+        state["tp1_done"] = True
+        state["qty"] = round_down(max(current_qty - executed_qty, 0.0), 3)
+        save_state(state)
+
+        append_trade_log(
+            opened_at=opened_at,
+            closed_at=utc_now(),
+            side="SHORT",
+            qty=executed_qty,
+            entry_price=entry_price,
+            exit_price=close_price,
+            pnl_gross=pnl_gross,
+            close_reason="tp1_short_30pct"
+        )
+
+        return {
+            "message": "TP1_SHORT ejecutado (30%)",
+            "closed_qty": executed_qty,
+            "remaining_qty_state": state["qty"],
+            "exit_price": close_price,
+            "pnl_gross": pnl_gross,
+            "close_result": close_result
+        }
+
+    if action == "tp2_short":
+        if current_side != "SHORT":
+            return {"message": "No hay SHORT abierto para TP2_SHORT."}
+        if not tp1_done:
+            return {"message": "TP2_SHORT bloqueado: primero debe ejecutarse TP1_SHORT."}
+        if tp2_done:
+            return {"message": "TP2_SHORT ya ejecutado."}
+
+        close_result, qty_closed = close_partial_position(current_side, current_qty, TP2_CLOSE_RATIO)
+        close_price, executed_qty = extract_order_data(close_result)
+        executed_qty = executed_qty if executed_qty is not None else qty_closed
+
+        pnl_gross = calc_gross_pnl("SHORT", executed_qty, entry_price, close_price)
+
+        state["tp2_done"] = True
+        state["qty"] = round_down(max(current_qty - executed_qty, 0.0), 3)
+        save_state(state)
+
+        append_trade_log(
+            opened_at=opened_at,
+            closed_at=utc_now(),
+            side="SHORT",
+            qty=executed_qty,
+            entry_price=entry_price,
+            exit_price=close_price,
+            pnl_gross=pnl_gross,
+            close_reason="tp2_short_30pct"
+        )
+
+        return {
+            "message": "TP2_SHORT ejecutado (30%)",
+            "closed_qty": executed_qty,
+            "remaining_qty_state": state["qty"],
+            "exit_price": close_price,
+            "pnl_gross": pnl_gross,
+            "close_result": close_result
+        }
+
+    return None
+
+
 # =========================
 # RUTAS
 # =========================
 @app.route("/", methods=["GET"])
 def home():
-    return "GOLD BOT ACTIVO - SIN IA - SOLO A FAVOR 15M", 200
+    return "GOLD BOT TEST ACTIVO - PARCIALES 30/30/40", 200
 
 
 @app.route("/logs", methods=["GET"])
@@ -657,24 +851,24 @@ def webhook():
     htf_signal = str(data.get("htf_signal", "")).upper().strip()
     incoming_symbol = str(data.get("symbol", "")).strip()
 
-    # Validar símbolo exacto
     if incoming_symbol != SYMBOL:
         msg = f"Señal ignorada: símbolo recibido {incoming_symbol} != {SYMBOL}"
         print(msg, flush=True)
         append_event_log("ignored", msg, {"received": data})
         return jsonify({"ok": True, "ignored": True, "message": msg}), 200
 
-    # Traducir acción
-    if action_raw == "BUY":
-        action = "buy"
-    elif action_raw == "SELL":
-        action = "sell"
-    elif action_raw == "CLOSE_LONG":
-        action = "close_long"
-    elif action_raw == "CLOSE_SHORT":
-        action = "close_short"
-    else:
-        action = ""
+    action_map = {
+        "BUY": "buy",
+        "SELL": "sell",
+        "CLOSE_LONG": "close_long",
+        "CLOSE_SHORT": "close_short",
+        "TP1_LONG": "tp1_long",
+        "TP2_LONG": "tp2_long",
+        "TP1_SHORT": "tp1_short",
+        "TP2_SHORT": "tp2_short",
+    }
+
+    action = action_map.get(action_raw, "")
 
     if action == "":
         append_event_log(action_raw, "Acción inválida", {"received": data})
@@ -685,20 +879,26 @@ def webhook():
         }), 400
 
     try:
-        # 1) Cierres explícitos siempre se ejecutan
+        # 1) Parciales
+        if action in ["tp1_long", "tp2_long", "tp1_short", "tp2_short"]:
+            partial_result = execute_partial_close(action)
+            print("PARCIAL ->", partial_result, flush=True)
+            append_event_log(action, partial_result.get("message", "Parcial ejecutado"), partial_result)
+            return jsonify({"ok": True, "result": partial_result}), 200
+
+        # 2) Cierres explícitos finales
         if action in ["close_long", "close_short"]:
             close_result = execute_explicit_close(action)
             print("CIERRE EXPLÍCITO ->", close_result, flush=True)
             append_event_log(action, close_result.get("message", "Cierre explícito"), close_result)
             return jsonify({"ok": True, "result": close_result}), 200
 
-        # 2) Si hay posición contraria abierta, primero cerrarla
+        # 3) Si hay posición contraria abierta, cerrarla
         close_result = execute_close_by_opposite_signal(action)
         if close_result is not None:
             print("CIERRE POR SEÑAL CONTRARIA ->", close_result, flush=True)
             append_event_log(action, close_result.get("message", "Cierre por señal contraria"), close_result)
 
-            # Después de cerrar, revisar si la nueva señal está alineada con 15m
             alignment = determine_alignment(action, htf_signal)
             if alignment != "with_htf":
                 msg = f"Posición cerrada, pero nueva entrada bloqueada: acción {action_raw} no está a favor del 15m ({htf_signal})"
@@ -711,7 +911,6 @@ def webhook():
                     "message": msg
                 }), 200
 
-            # Si sí está alineada, abrir la nueva posición
             open_result = execute_open(action)
             print("REVERSAL EJECUTADO ->", open_result, flush=True)
             append_event_log(action, open_result.get("message", "Reversal ejecutado"), open_result)
@@ -722,7 +921,7 @@ def webhook():
                 "opened_result": open_result
             }), 200
 
-        # 3) Si no había posición contraria, solo abrir si está a favor del 15m
+        # 4) Si no había contraria, abrir solo a favor del 15m
         alignment = determine_alignment(action, htf_signal)
         if alignment != "with_htf":
             msg = f"Trade bloqueado: acción {action_raw} no está a favor del 15m ({htf_signal})"
@@ -734,7 +933,6 @@ def webhook():
                 "message": msg
             }), 200
 
-        # 4) Abrir nueva posición
         result = execute_open(action)
         print("RESULTADO TRADE ->", result, flush=True)
         append_event_log(action, result.get("message", "Trade ejecutado"), result)
