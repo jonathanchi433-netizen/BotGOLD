@@ -293,18 +293,8 @@ def get_current_position_info():
 # LÓGICA HTF DESDE ALERTA
 # =========================
 def determine_alignment(action: str, htf_signal: str):
-    htf_signal = str(htf_signal or "").upper().strip()
-
-    if htf_signal not in ["BUY", "SELL"]:
-        return "neutral_htf"
-
-    if action == "buy":
-        return "with_htf" if htf_signal == "BUY" else "against_htf"
-
-    if action == "sell":
-        return "with_htf" if htf_signal == "SELL" else "against_htf"
-
-    return "neutral_htf"
+    # MODO TEST: dejar pasar todas las señales
+    return "with_htf"
 
 
 # =========================
@@ -334,7 +324,6 @@ def sync_state_with_exchange():
         save_state(inferred_state)
         state = inferred_state
 
-    # Asegurar campos nuevos
     if "tp1_done" not in state:
         state["tp1_done"] = False
     if "tp2_done" not in state:
@@ -422,7 +411,6 @@ def close_position(current_side, current_qty):
 def close_partial_position(current_side, current_qty, ratio):
     qty_to_close = round_down(current_qty * ratio, 3)
 
-    # Si el parcial sale muy pequeño, cerrar el mínimo posible o todo lo restante
     if qty_to_close <= 0:
         qty_to_close = round_down(current_qty, 3)
 
@@ -817,7 +805,7 @@ def execute_partial_close(action):
 # =========================
 @app.route("/", methods=["GET"])
 def home():
-    return "GOLD BOT TEST ACTIVO - PARCIALES 30/30/40", 200
+    return "GOLD BOT TEST ACTIVO - PARCIALES 30/30/40 - SIN FILTRO 15M", 200
 
 
 @app.route("/logs", methods=["GET"])
@@ -921,7 +909,7 @@ def webhook():
                 "opened_result": open_result
             }), 200
 
-        # 4) Si no había contraria, abrir solo a favor del 15m
+        # 4) Si no había contraria, abrir
         alignment = determine_alignment(action, htf_signal)
         if alignment != "with_htf":
             msg = f"Trade bloqueado: acción {action_raw} no está a favor del 15m ({htf_signal})"
